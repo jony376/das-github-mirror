@@ -511,9 +511,10 @@ export class GitHubFetcherService implements OnModuleInit {
    * Resolve the PR responsible for an issue's current closed state.
    *
    * Reads `ClosedEvent.closer` from the issue timeline and anchors to the
-   * issue's current `closedAt`, so reopen-then-reclose cycles attribute to
-   * the latest closer, not whichever PR first declared `Closes #N` in its
-   * body. When no PR closer is recorded — e.g. the issue was closed manually
+   * issue's most-recent close (GitHub freezes `closedAt` at the *first* close,
+   * so the latest `ClosedEvent` is used as the effective close), so reopen-
+   * then-reclose cycles attribute to the latest closer, not whichever PR first
+   * declared `Closes #N` in its body. When no PR closer is recorded — e.g. the issue was closed manually
    * rather than auto-closed by the merge — falls back to the issue's
    * closing-PR references (a merged same-repo PR). Returns `null` for non-PR
    * closures (commits, projects), `NOT_PLANNED` closures, or when neither
@@ -598,16 +599,16 @@ export class GitHubFetcherService implements OnModuleInit {
       closedAt: string | null;
       timelineItems?: { nodes?: any[] };
     },
+    effectiveClosedAt: string | null,
   ): number | null {
-    const closedAt = issue.closedAt;
-    if (!closedAt) return null;
+    if (!effectiveClosedAt) return null;
 
     const expectedRepo = repoFullName.toLowerCase();
     const nodes = issue.timelineItems?.nodes ?? [];
 
     // Walk newest to oldest, find the close event matching the issue's
-    // current closedAt. NOT_PLANNED closures (and anything else non-COMPLETED)
-    // don't attribute a solver.
+    // current (most-recent) close. NOT_PLANNED closures (and anything else
+    // non-COMPLETED) don't attribute a solver.
     for (let i = nodes.length - 1; i >= 0; i--) {
       const ev = nodes[i];
       if (!ev) continue;
@@ -618,7 +619,7 @@ export class GitHubFetcherService implements OnModuleInit {
       ) {
         continue;
       }
-      if (ev.createdAt !== closedAt) continue;
+      if (ev.createdAt !== effectiveClosedAt) continue;
       const closer = ev.closer;
       if (!closer || closer.__typename !== "PullRequest") return null;
       if (
@@ -637,6 +638,25 @@ export class GitHubFetcherService implements OnModuleInit {
   }
 
   /**
+   * GitHub freezes `issue.closedAt` at the first time the issue entered the
+   * closed state and does not advance it on a re-close, so it is unreliable as
+   * the "current close" anchor for a reopened issue. The current close is the
+   * most-recent CLOSED_EVENT in the timeline; use its `createdAt`. Falls back to
+   * `issue.closedAt` only when the timeline carries no CLOSED_EVENT.
+   */
+  private effectiveClosedAt(issue: {
+    closedAt: string | null;
+    timelineItems?: { nodes?: any[] };
+  }): string | null {
+    const nodes = issue.timelineItems?.nodes ?? [];
+    for (let i = nodes.length - 1; i >= 0; i--) {
+      const createdAt = nodes[i]?.createdAt;
+      if (createdAt) return createdAt;
+    }
+    return issue.closedAt;
+  }
+
+  /**
    * Resolve an issue's solving PR: prefer the authoritative
    * `ClosedEvent.closer`, then fall back to the issue's closing-PR references.
    * Shared by the webhook closure path and the backfill so both write
@@ -651,9 +671,18 @@ export class GitHubFetcherService implements OnModuleInit {
       closedByPullRequestsReferences?: { nodes?: any[] };
     },
   ): number | null {
-    const viaCloser = this.selectClosingPrFromTimeline(repoFullName, issue);
+    const effectiveClosedAt = this.effectiveClosedAt(issue);
+    const viaCloser = this.selectClosingPrFromTimeline(
+      repoFullName,
+      issue,
+      effectiveClosedAt,
+    );
     if (viaCloser != null) return viaCloser;
-    return this.selectClosingPrFromClosingRefs(repoFullName, issue);
+    return this.selectClosingPrFromClosingRefs(
+      repoFullName,
+      issue,
+      effectiveClosedAt,
+    );
   }
 
   /**
@@ -671,6 +700,7 @@ export class GitHubFetcherService implements OnModuleInit {
       stateReason?: string | null;
       closedByPullRequestsReferences?: { nodes?: any[] };
     },
+    effectiveClosedAt: string | null,
   ): number | null {
     // Only COMPLETED closures attribute a solver — parity with the closer path.
     if (
@@ -680,7 +710,7 @@ export class GitHubFetcherService implements OnModuleInit {
       return null;
     }
 
-    const closedAt = issue.closedAt ? Date.parse(issue.closedAt) : null;
+    const closedAt = effectiveClosedAt ? Date.parse(effectiveClosedAt) : null;
     const expectedRepo = repoFullName.toLowerCase();
 
     const candidates = (issue.closedByPullRequestsReferences?.nodes ?? [])

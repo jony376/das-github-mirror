@@ -1,10 +1,16 @@
 /* eslint-disable @typescript-eslint/no-unsafe-return, @typescript-eslint/no-unsafe-assignment */
 import { Injectable } from "@nestjs/common";
-import { DataSource } from "typeorm";
+import { InjectRepository } from "@nestjs/typeorm";
+import { DataSource, IsNull, Not, Raw, Repository } from "typeorm";
+import { Repo } from "../../entities";
 
 @Injectable()
 export class ReposService {
-  constructor(private readonly dataSource: DataSource) {}
+  constructor(
+    private readonly dataSource: DataSource,
+    @InjectRepository(Repo)
+    private readonly repoRepo: Repository<Repo>,
+  ) {}
 
   async getMaintainers(
     owner: string,
@@ -36,6 +42,28 @@ export class ReposService {
       repo_full_name: repoFullName.toLowerCase(),
       generated_at: new Date().toISOString(),
       maintainers: rows,
+    };
+  }
+
+  async getInstallationStatus(
+    owner: string,
+    repo: string,
+  ): Promise<{ repo_full_name: string; installed: boolean }> {
+    const repoFullName = `${owner}/${repo}`;
+
+    // Case-insensitive match (#120); installed regardless of `registered`.
+    const count = await this.repoRepo.count({
+      where: {
+        repoFullName: Raw((alias) => `LOWER(${alias}) = LOWER(:repoFullName)`, {
+          repoFullName,
+        }),
+        installationId: Not(IsNull()),
+      },
+    });
+
+    return {
+      repo_full_name: repoFullName.toLowerCase(),
+      installed: count > 0,
     };
   }
 }

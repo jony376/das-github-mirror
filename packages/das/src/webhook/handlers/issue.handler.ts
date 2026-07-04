@@ -25,6 +25,17 @@ export class IssueHandler {
     // Skip pull request events delivered as issue events
     if (issue.pull_request) return;
 
+    if (payload.action === "deleted") {
+      await this.issueRepo.delete({
+        repoFullName,
+        issueNumber: issue.number,
+      });
+      await this.repoRepo.update(repoFullName, {
+        lastEventAt: new Date().toISOString(),
+      });
+      return;
+    }
+
     const issueState = issue.state.toUpperCase();
     const data: Partial<Issue> = {
       repoFullName,

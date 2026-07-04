@@ -14,6 +14,14 @@ import {
   Repo,
   Review,
 } from "../entities";
+import {
+  GitHubRateLimitError,
+  isGraphQLRateLimit,
+} from "./github-rate-limit.error";
+import {
+  needsContentRefresh,
+  needsMetadataRefresh,
+} from "./incremental-backfill";
 
 interface InstallationToken {
   token: string;
@@ -23,6 +31,17 @@ interface InstallationToken {
 interface ClosingIssueReference {
   number?: number;
   repository?: { nameWithOwner?: string } | null;
+}
+
+/**
+ * A user's current maintainer role for a repo, sourced live from GitHub's
+ * collaborators/members APIs. `association` mirrors GitHub's author_association
+ * vocabulary so it can be written straight onto the stored activity rows.
+ */
+export interface MaintainerRole {
+  githubId: string;
+  login: string;
+  association: "OWNER" | "MEMBER" | "COLLABORATOR";
 }
 
 // Files larger than this are stored with null content (AST parsing is wasteful past this).
@@ -150,8 +169,23 @@ export class GitHubFetcherService implements OnModuleInit {
     return 60_000;
   }
 
-  private assertNoGraphQLErrors(body: any, context: string): void {
+  private assertNoGraphQLErrors(
+    body: any,
+    context: string,
+    res: Response,
+  ): void {
     if (!body?.errors) return;
+
+    // GraphQL rate limits arrive as HTTP 200 with the error in the body (unlike
+    // REST's 403/429), so they bypass githubFetch's status-based handling.
+    // Surface them as a typed error the queue processor can defer on, instead
+    // of a generic throw that burns the job's retry attempts.
+    if (isGraphQLRateLimit(body.errors)) {
+      throw new GitHubRateLimitError(
+        `${context} rate limited: ${JSON.stringify(body.errors)}`,
+        this.computeRetryAfterMs(res),
+      );
+    }
 
     throw new Error(
       `${context} GraphQL errors: ${JSON.stringify(body.errors)}`,
@@ -213,6 +247,99 @@ export class GitHubFetcherService implements OnModuleInit {
       throw new Error(`No installation for repo ${repoFullName}`);
     }
     return this.getInstallationToken(repo.installationId);
+  }
+
+  // --- REST: live maintainer roles (collaborators + org members) ---
+
+  /**
+   * Collaborators on the repo, returned as COLLABORATOR. The reconciler upgrades
+   * org members to MEMBER and the repo owner to OWNER. We use affiliation=all (not
+   * =direct) so access granted via a team or org base permission is included, not
+   * just users explicitly added to the repo. This is deliberate: the live
+   * maintainers table must reproduce GitHub's author_association (OWNER / MEMBER /
+   * COLLABORATOR), which marks any org insider with repo access as a maintainer
+   * regardless of how that access was granted. affiliation=direct missed
+   * team/base-permission insiders, so org-owned repos whose members are private
+   * (the GitHub default) resolved to an empty maintainer set and were skipped.
+   */
+  async fetchRepoCollaborators(
+    repoFullName: string,
+  ): Promise<MaintainerRole[]> {
+    const token = await this.getTokenForRepo(repoFullName);
+    const [owner, repo] = repoFullName.split("/");
+    const users = await this.restGetAllPages(
+      `https://api.github.com/repos/${owner}/${repo}/collaborators?affiliation=all&per_page=100`,
+      token,
+    );
+    return users.map((u: any) => ({
+      githubId: String(u.id),
+      login: u.login,
+      association: "COLLABORATOR" as const,
+    }));
+  }
+
+  /**
+   * Members of the owning org, returned as MEMBER. Resolves to [] when the
+   * owner is a user account — /orgs/{user}/members 404s, which is correct: a
+   * user-owned repo has only its owner and collaborators, no org members.
+   */
+  async fetchOrgMembers(repoFullName: string): Promise<MaintainerRole[]> {
+    const token = await this.getTokenForRepo(repoFullName);
+    const org = repoFullName.split("/")[0];
+    const users = await this.restGetAllPages(
+      `https://api.github.com/orgs/${org}/members?per_page=100`,
+      token,
+      { allow404: true },
+    );
+    return users.map((u: any) => ({
+      githubId: String(u.id),
+      login: u.login,
+      association: "MEMBER" as const,
+    }));
+  }
+
+  /**
+   * GET every page of a paginated REST list endpoint, following the Link
+   * header. Throws on any non-2xx (so callers fail closed) except a 404 when
+   * `allow404` is set, which resolves to an empty list.
+   */
+  private async restGetAllPages(
+    url: string,
+    token: string,
+    opts: { allow404?: boolean } = {},
+  ): Promise<any[]> {
+    const results: any[] = [];
+    let next: string | null = url;
+
+    while (next) {
+      const res = await this.githubFetch(next, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: "application/vnd.github+json",
+          "X-GitHub-Api-Version": "2022-11-28",
+        },
+      });
+      if (res.status === 404 && opts.allow404) return [];
+      if (!res.ok) {
+        throw new Error(
+          `GitHub GET ${next} failed: ${res.status} ${await res.text()}`,
+        );
+      }
+      const page = await res.json();
+      if (Array.isArray(page)) results.push(...page);
+      next = this.parseNextLink(res.headers.get("link"));
+    }
+
+    return results;
+  }
+
+  private parseNextLink(linkHeader: string | null): string | null {
+    if (!linkHeader) return null;
+    for (const part of linkHeader.split(",")) {
+      const match = part.match(/<([^>]+)>;\s*rel="next"/);
+      if (match) return match[1];
+    }
+    return null;
   }
 
   // --- REST: compare API for merge-base ---
@@ -287,16 +414,30 @@ export class GitHubFetcherService implements OnModuleInit {
     closingIssueNumbers: number[];
     body: string | null;
     lastEditedAt: string | null;
+    state: string;
+    mergedAt: string | null;
+    closedAt: string | null;
+    mergedByLogin: string | null;
   }> {
     const [owner, repo] = repoFullName.split("/");
     const token = await this.getTokenForRepo(repoFullName);
 
+    // `state`/`mergedAt`/`closedAt`/`mergedBy` are returned alongside the body
+    // so the metadata-fetch path can re-assert authoritative PR state — this is
+    // what lets a missed `pull_request.closed` webhook self-heal (the webhook
+    // handler is otherwise the only writer of state). GraphQL `state` is the
+    // source of truth (OPEN / CLOSED / MERGED), unlike REST which reports a
+    // merged PR as `closed` + `merged: true`.
     const query = `
       query($owner: String!, $repo: String!, $pr: Int!) {
         repository(owner: $owner, name: $repo) {
           pullRequest(number: $pr) {
             bodyText
             lastEditedAt
+            state
+            mergedAt
+            closedAt
+            mergedBy { login }
             closingIssuesReferences(first: 10) {
               nodes {
                 number
@@ -327,7 +468,7 @@ export class GitHubFetcherService implements OnModuleInit {
     }
 
     const body: any = await res.json();
-    this.assertNoGraphQLErrors(body, "PR metadata fetch");
+    this.assertNoGraphQLErrors(body, "PR metadata fetch", res);
 
     const pr = body.data?.repository?.pullRequest;
     if (!pr) {
@@ -343,6 +484,10 @@ export class GitHubFetcherService implements OnModuleInit {
       ),
       body: pr.bodyText ?? null,
       lastEditedAt: pr.lastEditedAt ?? null,
+      state: pr.state,
+      mergedAt: pr.mergedAt ?? null,
+      closedAt: pr.closedAt ?? null,
+      mergedByLogin: pr.mergedBy?.login ?? null,
     };
   }
 
@@ -366,11 +511,14 @@ export class GitHubFetcherService implements OnModuleInit {
    * Resolve the PR responsible for an issue's current closed state.
    *
    * Reads `ClosedEvent.closer` from the issue timeline and anchors to the
-   * issue's current `closedAt`, so reopen-then-reclose cycles attribute to
-   * the latest closer, not whichever PR first declared `Closes #N` in its
-   * body. Returns the PR number when the closer is a merged same-repo PR;
-   * `null` for manual closes, non-PR closers (commits, projects), or
-   * `NOT_PLANNED` closures.
+   * issue's most-recent close (GitHub freezes `closedAt` at the *first* close,
+   * so the latest `ClosedEvent` is used as the effective close), so reopen-
+   * then-reclose cycles attribute to the latest closer, not whichever PR first
+   * declared `Closes #N` in its body. When no PR closer is recorded — e.g. the issue was closed manually
+   * rather than auto-closed by the merge — falls back to the issue's
+   * closing-PR references (a merged same-repo PR). Returns `null` for non-PR
+   * closures (commits, projects), `NOT_PLANNED` closures, or when neither
+   * source yields a qualifying merged same-repo PR.
    *
    * Source of truth for `issues.solved_by_pr`. Issue discovery and the
    * issue-bounty solver lookup both read from this field, so they stay 1:1.
@@ -387,6 +535,7 @@ export class GitHubFetcherService implements OnModuleInit {
         repository(owner: $owner, name: $repo) {
           issue(number: $issue) {
             closedAt
+            stateReason
             timelineItems(itemTypes: [CLOSED_EVENT], last: 20) {
               nodes {
                 ... on ClosedEvent {
@@ -402,6 +551,14 @@ export class GitHubFetcherService implements OnModuleInit {
                     }
                   }
                 }
+              }
+            }
+            closedByPullRequestsReferences(first: 10, includeClosedPrs: true) {
+              nodes {
+                number
+                merged
+                mergedAt
+                baseRepository { nameWithOwner }
               }
             }
           }
@@ -428,12 +585,12 @@ export class GitHubFetcherService implements OnModuleInit {
     }
 
     const body: any = await res.json();
-    this.assertNoGraphQLErrors(body, "Issue closure fetch");
+    this.assertNoGraphQLErrors(body, "Issue closure fetch", res);
 
     const issue = body.data?.repository?.issue;
     if (!issue) return null;
 
-    return this.selectClosingPrFromTimeline(repoFullName, issue);
+    return this.selectClosingPr(repoFullName, issue);
   }
 
   private selectClosingPrFromTimeline(
@@ -442,16 +599,16 @@ export class GitHubFetcherService implements OnModuleInit {
       closedAt: string | null;
       timelineItems?: { nodes?: any[] };
     },
+    effectiveClosedAt: string | null,
   ): number | null {
-    const closedAt = issue.closedAt;
-    if (!closedAt) return null;
+    if (!effectiveClosedAt) return null;
 
     const expectedRepo = repoFullName.toLowerCase();
     const nodes = issue.timelineItems?.nodes ?? [];
 
     // Walk newest to oldest, find the close event matching the issue's
-    // current closedAt. NOT_PLANNED closures (and anything else non-COMPLETED)
-    // don't attribute a solver.
+    // current (most-recent) close. NOT_PLANNED closures (and anything else
+    // non-COMPLETED) don't attribute a solver.
     for (let i = nodes.length - 1; i >= 0; i--) {
       const ev = nodes[i];
       if (!ev) continue;
@@ -462,7 +619,7 @@ export class GitHubFetcherService implements OnModuleInit {
       ) {
         continue;
       }
-      if (ev.createdAt !== closedAt) continue;
+      if (ev.createdAt !== effectiveClosedAt) continue;
       const closer = ev.closer;
       if (!closer || closer.__typename !== "PullRequest") return null;
       if (
@@ -478,6 +635,107 @@ export class GitHubFetcherService implements OnModuleInit {
       return typeof closer.number === "number" ? closer.number : null;
     }
     return null;
+  }
+
+  /**
+   * GitHub freezes `issue.closedAt` at the first time the issue entered the
+   * closed state and does not advance it on a re-close, so it is unreliable as
+   * the "current close" anchor for a reopened issue. The current close is the
+   * most-recent CLOSED_EVENT in the timeline; use its `createdAt`. Falls back to
+   * `issue.closedAt` only when the timeline carries no CLOSED_EVENT.
+   */
+  private effectiveClosedAt(issue: {
+    closedAt: string | null;
+    timelineItems?: { nodes?: any[] };
+  }): string | null {
+    const nodes = issue.timelineItems?.nodes ?? [];
+    for (let i = nodes.length - 1; i >= 0; i--) {
+      const createdAt = nodes[i]?.createdAt;
+      if (createdAt) return createdAt;
+    }
+    return issue.closedAt;
+  }
+
+  /**
+   * Resolve an issue's solving PR: prefer the authoritative
+   * `ClosedEvent.closer`, then fall back to the issue's closing-PR references.
+   * Shared by the webhook closure path and the backfill so both write
+   * `issues.solved_by_pr` identically.
+   */
+  private selectClosingPr(
+    repoFullName: string,
+    issue: {
+      closedAt: string | null;
+      stateReason?: string | null;
+      timelineItems?: { nodes?: any[] };
+      closedByPullRequestsReferences?: { nodes?: any[] };
+    },
+  ): number | null {
+    const effectiveClosedAt = this.effectiveClosedAt(issue);
+    const viaCloser = this.selectClosingPrFromTimeline(
+      repoFullName,
+      issue,
+      effectiveClosedAt,
+    );
+    if (viaCloser != null) return viaCloser;
+    return this.selectClosingPrFromClosingRefs(
+      repoFullName,
+      issue,
+      effectiveClosedAt,
+    );
+  }
+
+  /**
+   * Fallback attribution from `closedByPullRequestsReferences` for issues that
+   * were closed without GitHub recording a PR closer (manual close, or a
+   * `Closes #N` keyword added after the PR merged). Gated to a COMPLETED
+   * closure and a merged same-repo PR that merged at or before the close —
+   * downstream gates (token threshold, one-issue-per-PR, author ≠ solver,
+   * branch eligibility) still apply on the consumer side.
+   */
+  private selectClosingPrFromClosingRefs(
+    repoFullName: string,
+    issue: {
+      closedAt: string | null;
+      stateReason?: string | null;
+      closedByPullRequestsReferences?: { nodes?: any[] };
+    },
+    effectiveClosedAt: string | null,
+  ): number | null {
+    // Only COMPLETED closures attribute a solver — parity with the closer path.
+    if (
+      issue.stateReason != null &&
+      String(issue.stateReason).toUpperCase() !== "COMPLETED"
+    ) {
+      return null;
+    }
+
+    const closedAt = effectiveClosedAt ? Date.parse(effectiveClosedAt) : null;
+    const expectedRepo = repoFullName.toLowerCase();
+
+    const candidates = (issue.closedByPullRequestsReferences?.nodes ?? [])
+      .filter((n: any) => n?.merged === true)
+      .filter(
+        (n: any) =>
+          (n.baseRepository?.nameWithOwner ?? "").toLowerCase() ===
+          expectedRepo,
+      )
+      .filter((n: any) => {
+        // A PR can't have caused a close that predates its merge.
+        if (closedAt == null || !n.mergedAt) return true;
+        return Date.parse(n.mergedAt) <= closedAt;
+      });
+
+    if (candidates.length === 0) return null;
+
+    // Deterministic pick: latest merge on/before the close (closest cause),
+    // tie-broken by highest PR number.
+    candidates.sort(
+      (a: any, b: any) =>
+        (Date.parse(b.mergedAt ?? "") || 0) -
+          (Date.parse(a.mergedAt ?? "") || 0) || b.number - a.number,
+    );
+    return candidates[0].number;
   }
 
   // --- PR files + contents (REST for list, batched GraphQL for contents) ---
@@ -666,6 +924,10 @@ export class GitHubFetcherService implements OnModuleInit {
         );
         i += batch.length;
       } catch (err) {
+        // A rate limit isn't a too-big-batch problem — halving just spams more
+        // doomed requests at an exhausted budget. Let it propagate so the queue
+        // processor defers the whole job until the budget resets.
+        if (err instanceof GitHubRateLimitError) throw err;
         if (batchSize > minBatchSize) {
           const newSize = Math.max(Math.floor(batchSize / 2), minBatchSize);
           this.logger.warn(
@@ -740,7 +1002,7 @@ export class GitHubFetcherService implements OnModuleInit {
     }
 
     const body: any = await res.json();
-    this.assertNoGraphQLErrors(body, "Content fetch");
+    this.assertNoGraphQLErrors(body, "Content fetch", res);
 
     const repoData = body.data?.repository ?? {};
 
@@ -797,12 +1059,32 @@ export class GitHubFetcherService implements OnModuleInit {
    * Page through GraphQL for PRs in a repo created within the last N days.
    * Upserts each PR. Returns the list of PR numbers so the caller can
    * enqueue follow-up fetch jobs for diffs + closing issues.
+   *
+   * The backfill is a safety net behind real-time webhook ingestion, so for
+   * each PR we compare the freshly-fetched values against the PRE-upsert stored
+   * row and return per-PR gating flags so the caller re-fetches only what
+   * actually changed (see #incremental-backfill):
+   *   - needsFilesJob:    the PR_FILES content fetch (REST file list + merge-base
+   *     + batched GraphQL content) is fully determined by head+base SHA. Skip it
+   *     only when the stored row already has its content (scoringDataStored) AND
+   *     both SHAs are unchanged.
+   *   - needsMetadataJob: the PR_METADATA fetch (closing-issue links, body, state,
+   *     merged/closed timestamps) is gated on GitHub's pull request updatedAt,
+   *     which bumps on edits, state changes, merges, closes and link changes.
+   * Both flags fail safe toward re-fetching: a new PR, a missing stored value,
+   * or any uncertainty forces the job to be enqueued.
    */
   async backfillPullRequests(
     repoFullName: string,
     sinceDate: Date,
   ): Promise<
-    { prNumber: number; headSha: string | null; baseSha: string | null }[]
+    {
+      prNumber: number;
+      headSha: string | null;
+      baseSha: string | null;
+      needsFilesJob: boolean;
+      needsMetadataJob: boolean;
+    }[]
   > {
     const [owner, repo] = repoFullName.split("/");
     const token = await this.getTokenForRepo(repoFullName);
@@ -825,6 +1107,7 @@ export class GitHubFetcherService implements OnModuleInit {
               createdAt
               closedAt
               mergedAt
+              updatedAt
               lastEditedAt
               merged
               author {
@@ -889,6 +1172,8 @@ export class GitHubFetcherService implements OnModuleInit {
       prNumber: number;
       headSha: string | null;
       baseSha: string | null;
+      needsFilesJob: boolean;
+      needsMetadataJob: boolean;
     }[] = [];
     let cursor: string | null = null;
     let defaultBranchWritten = false;
@@ -916,7 +1201,7 @@ export class GitHubFetcherService implements OnModuleInit {
       }
 
       const body: any = await res.json();
-      this.assertNoGraphQLErrors(body, "Backfill PR fetch");
+      this.assertNoGraphQLErrors(body, "Backfill PR fetch", res);
 
       const repoData: any = body.data?.repository;
       const page: any = repoData?.pullRequests;
@@ -942,6 +1227,26 @@ export class GitHubFetcherService implements OnModuleInit {
           break;
         }
 
+        const headSha: string | null = pr.headRefOid ?? null;
+        const baseSha: string | null = pr.baseRefOid ?? null;
+        const updatedAt: string | null = pr.updatedAt ?? null;
+
+        // Capture the PRE-upsert stored row: the upsert below overwrites it, so
+        // the change-detection must read the old values first. A missing row
+        // (new PR) leaves `existing` undefined and forces both jobs.
+        const existing = await this.prRepo.findOne({
+          where: { repoFullName, prNumber: pr.number },
+          select: {
+            headSha: true,
+            baseSha: true,
+            updatedAt: true,
+            scoringDataStored: true,
+          },
+        });
+
+        const needsFilesJob = needsContentRefresh(existing, headSha, baseSha);
+        const needsMetadataJob = needsMetadataRefresh(existing, updatedAt);
+
         await this.prRepo.upsert(
           {
             repoFullName,
@@ -955,13 +1260,16 @@ export class GitHubFetcherService implements OnModuleInit {
             createdAt: pr.createdAt,
             closedAt: pr.closedAt ?? null,
             mergedAt: pr.mergedAt ?? null,
+            updatedAt,
             lastEditedAt: pr.lastEditedAt ?? null,
             mergedByLogin: pr.mergedBy?.login ?? null,
             baseRef: pr.baseRef?.name ?? null,
             headRef: pr.headRef?.name ?? null,
             headRepoFullName: pr.headRepository?.nameWithOwner ?? null,
-            headSha: pr.headRefOid ?? null,
-            baseSha: pr.baseRefOid ?? null,
+            // head/base SHA columns are nullable in the DB but typed non-null
+            // on the entity; null is a valid stored value (e.g. deleted head).
+            headSha: headSha as string,
+            baseSha: baseSha as string,
             additions: pr.additions ?? null,
             deletions: pr.deletions ?? null,
             commitsCount: pr.commits?.totalCount ?? null,
@@ -1000,8 +1308,10 @@ export class GitHubFetcherService implements OnModuleInit {
 
         prs.push({
           prNumber: pr.number,
-          headSha: pr.headRefOid ?? null,
-          baseSha: pr.baseRefOid ?? null,
+          headSha,
+          baseSha,
+          needsFilesJob,
+          needsMetadataJob,
         });
       }
 
@@ -1014,9 +1324,10 @@ export class GitHubFetcherService implements OnModuleInit {
 
   /**
    * Page through GraphQL for issues in a repo created within the last N days.
-   * Upserts each issue.
+   * Upserts each issue. Returns the number of issues processed (for the
+   * backfill summary log).
    */
-  async backfillIssues(repoFullName: string, sinceDate: Date): Promise<void> {
+  async backfillIssues(repoFullName: string, sinceDate: Date): Promise<number> {
     const [owner, repo] = repoFullName.split("/");
     const token = await this.getTokenForRepo(repoFullName);
 
@@ -1092,6 +1403,14 @@ export class GitHubFetcherService implements OnModuleInit {
                   }
                 }
               }
+              closedByPullRequestsReferences(first: 10, includeClosedPrs: true) {
+                nodes {
+                  number
+                  merged
+                  mergedAt
+                  baseRepository { nameWithOwner }
+                }
+              }
             }
           }
         }
@@ -1099,6 +1418,7 @@ export class GitHubFetcherService implements OnModuleInit {
     `;
 
     let cursor: string | null = null;
+    let issueCount = 0;
 
     while (true) {
       const res: Response = await this.githubFetch(
@@ -1123,7 +1443,7 @@ export class GitHubFetcherService implements OnModuleInit {
       }
 
       const body: any = await res.json();
-      this.assertNoGraphQLErrors(body, "Backfill issue fetch");
+      this.assertNoGraphQLErrors(body, "Backfill issue fetch", res);
 
       const page: any = body.data?.repository?.issues;
       if (!page) {
@@ -1166,9 +1486,13 @@ export class GitHubFetcherService implements OnModuleInit {
 
         issueData.solvedByPr =
           issue.state === "CLOSED"
-            ? this.selectClosingPrFromTimeline(repoFullName, {
+            ? this.selectClosingPr(repoFullName, {
                 closedAt: issue.closedAt ?? null,
+                stateReason: issue.stateReason ?? null,
                 timelineItems: { nodes: issue.closureTimeline?.nodes ?? [] },
+                closedByPullRequestsReferences: {
+                  nodes: issue.closedByPullRequestsReferences?.nodes ?? [],
+                },
               })
             : null;
 
@@ -1181,20 +1505,24 @@ export class GitHubFetcherService implements OnModuleInit {
           "issue",
           issue.timelineItems?.nodes ?? [],
         );
+
+        issueCount += 1;
       }
 
       if (shouldStop || !page.pageInfo.hasNextPage) break;
       cursor = page.pageInfo.endCursor;
     }
+
+    return issueCount;
   }
 
   /**
    * Insert LABELED_EVENT / UNLABELED_EVENT timeline nodes into label_events.
    * Idempotent: relies on the uq_label_events_natural_key UNIQUE index so
    * re-running backfill (or BullMQ retries) collapses to a no-op for events
-   * already written. Actor role is resolved at read time via
-   * contributor_repo_roles using stored PR/issue, review, and comment
-   * association evidence; GraphQL's actor type doesn't expose authorAssociation.
+   * already written. Actor role is resolved at read time against the live
+   * maintainers table (see pr_labels_by_actor view); GraphQL's actor type
+   * doesn't expose authorAssociation.
    */
   private async saveLabelTimelineEvents(
     repoFullName: string,

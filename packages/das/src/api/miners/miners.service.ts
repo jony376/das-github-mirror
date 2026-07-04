@@ -1,6 +1,7 @@
 /* eslint-disable @typescript-eslint/no-unsafe-return, @typescript-eslint/no-unsafe-assignment */
 import { Injectable } from "@nestjs/common";
 import { DataSource } from "typeorm";
+import { buildPaginatedResponse, PaginationParams } from "./pagination";
 
 const DEFAULT_SINCE_DAYS = 35;
 
@@ -15,7 +16,7 @@ const PR_SELECT_COLUMNS = `
         p.state,
         p.author_github_id,
         COALESCE(p.author_login, '')    AS author_login,
-        p.author_association,
+        COALESCE(m_author.association, p.author_association) AS author_association,
         p.created_at,
         p.closed_at,
         p.merged_at,
@@ -95,7 +96,7 @@ const ISSUE_SELECT_COLUMNS = `
         i.state_reason,
         i.author_github_id,
         i.author_login,
-        i.author_association,
+        COALESCE(m_author.association, i.author_association) AS author_association,
         i.created_at,
         i.closed_at,
         i.updated_at,
@@ -174,12 +175,32 @@ export class MinersService {
   async getPullRequests(
     githubId: string,
     since: string,
+    pagination: PaginationParams | null,
   ): Promise<{
     github_id: string;
     since: string;
     generated_at: string;
     pull_requests: unknown[];
+    next_cursor?: string | null;
   }> {
+    const cursor = pagination?.cursor ?? null;
+    const keysetClause = cursor
+      ? `AND (p.created_at, LOWER(p.repo_full_name), p.pr_number) < ($3::timestamptz, $4, $5::int)`
+      : "";
+    const limitClause = pagination ? `LIMIT $${cursor ? 6 : 3}` : "";
+    const params: unknown[] = !pagination
+      ? [githubId, since]
+      : cursor
+        ? [
+            githubId,
+            since,
+            cursor.createdAt,
+            cursor.repoFullName,
+            cursor.number,
+            pagination.limit + 1,
+          ]
+        : [githubId, since, pagination.limit + 1];
+
     const rows = await this.dataSource.query(
       `
       SELECT${PR_SELECT_COLUMNS}
@@ -189,22 +210,47 @@ export class MinersService {
        AND rs.pr_number      = p.pr_number
       LEFT JOIN repos r
         ON r.repo_full_name = p.repo_full_name
+      LEFT JOIN maintainers m_author
+        ON m_author.github_id = p.author_github_id
+       AND m_author.repo_full_name = LOWER(p.repo_full_name)
       WHERE p.author_github_id = $1
         AND (
           (p.state = 'OPEN'   AND p.created_at >= $2)
           OR (p.state = 'MERGED' AND p.merged_at >= $2)
           OR (p.state = 'CLOSED' AND p.created_at >= $2)
         )
-      ORDER BY p.created_at DESC
+        ${keysetClause}
+      ORDER BY p.created_at DESC, LOWER(p.repo_full_name) DESC, p.pr_number DESC
+      ${limitClause}
       `,
-      [githubId, since],
+      params,
+    );
+
+    if (!pagination) {
+      return {
+        github_id: githubId,
+        since,
+        generated_at: new Date().toISOString(),
+        pull_requests: rows,
+      };
+    }
+
+    const page = buildPaginatedResponse(
+      rows as Record<string, unknown>[],
+      pagination.limit,
+      (row) => ({
+        created_at: row.created_at as string,
+        repo_full_name: row.repo_full_name as string,
+        pr_number: row.pr_number as number,
+      }),
     );
 
     return {
       github_id: githubId,
       since,
       generated_at: new Date().toISOString(),
-      pull_requests: rows,
+      pull_requests: page.items,
+      next_cursor: page.nextCursor,
     };
   }
 
@@ -218,12 +264,33 @@ export class MinersService {
     githubId: string,
     repoNames: string[],
     sinceValues: string[],
+    pagination: PaginationParams | null,
   ): Promise<{
     github_id: string;
     since: null;
     generated_at: string;
     pull_requests: unknown[];
+    next_cursor?: string | null;
   }> {
+    const cursor = pagination?.cursor ?? null;
+    const keysetClause = cursor
+      ? `AND (p.created_at, LOWER(p.repo_full_name), p.pr_number) < ($4::timestamptz, $5, $6::int)`
+      : "";
+    const limitClause = pagination ? `LIMIT $${cursor ? 7 : 4}` : "";
+    const params: unknown[] = !pagination
+      ? [githubId, repoNames, sinceValues]
+      : cursor
+        ? [
+            githubId,
+            repoNames,
+            sinceValues,
+            cursor.createdAt,
+            cursor.repoFullName,
+            cursor.number,
+            pagination.limit + 1,
+          ]
+        : [githubId, repoNames, sinceValues, pagination.limit + 1];
+
     const rows = await this.dataSource.query(
       `
       WITH windows AS (
@@ -238,53 +305,123 @@ export class MinersService {
        AND rs.pr_number      = p.pr_number
       LEFT JOIN repos r
         ON r.repo_full_name = p.repo_full_name
+      LEFT JOIN maintainers m_author
+        ON m_author.github_id = p.author_github_id
+       AND m_author.repo_full_name = LOWER(p.repo_full_name)
       WHERE p.author_github_id = $1
         AND (
           (p.state = 'OPEN'   AND p.created_at >= w.since)
           OR (p.state = 'MERGED' AND p.merged_at >= w.since)
           OR (p.state = 'CLOSED' AND p.created_at >= w.since)
         )
-      ORDER BY p.created_at DESC
+        ${keysetClause}
+      ORDER BY p.created_at DESC, LOWER(p.repo_full_name) DESC, p.pr_number DESC
+      ${limitClause}
       `,
-      [githubId, repoNames, sinceValues],
+      params,
+    );
+
+    if (!pagination) {
+      return {
+        github_id: githubId,
+        since: null,
+        generated_at: new Date().toISOString(),
+        pull_requests: rows,
+      };
+    }
+
+    const page = buildPaginatedResponse(
+      rows as Record<string, unknown>[],
+      pagination.limit,
+      (row) => ({
+        created_at: row.created_at as string,
+        repo_full_name: row.repo_full_name as string,
+        pr_number: row.pr_number as number,
+      }),
     );
 
     return {
       github_id: githubId,
       since: null,
       generated_at: new Date().toISOString(),
-      pull_requests: rows,
+      pull_requests: page.items,
+      next_cursor: page.nextCursor,
     };
   }
 
   async getIssues(
     githubId: string,
     since: string | null,
+    pagination: PaginationParams | null,
   ): Promise<{
     github_id: string;
     since: string | null;
     generated_at: string;
     issues: unknown[];
+    next_cursor?: string | null;
   }> {
+    const cursor = pagination?.cursor ?? null;
+    const keysetClause = cursor
+      ? `AND (i.created_at, LOWER(i.repo_full_name), i.issue_number) < ($3::timestamptz, $4, $5::int)`
+      : "";
+    const limitClause = pagination ? `LIMIT $${cursor ? 6 : 3}` : "";
+    const params: unknown[] = !pagination
+      ? [githubId, since]
+      : cursor
+        ? [
+            githubId,
+            since,
+            cursor.createdAt,
+            cursor.repoFullName,
+            cursor.number,
+            pagination.limit + 1,
+          ]
+        : [githubId, since, pagination.limit + 1];
+
     const rows = await this.dataSource.query(
       `
       SELECT${ISSUE_SELECT_COLUMNS}
       FROM issues i
+      LEFT JOIN maintainers m_author
+        ON m_author.github_id = i.author_github_id
+       AND m_author.repo_full_name = LOWER(i.repo_full_name)
       WHERE i.author_github_id = $1
         AND (
           (i.state = 'OPEN' AND ($2::timestamptz IS NULL OR i.created_at >= $2))
           OR (i.state = 'CLOSED' AND i.closed_at >= $2)
         )
-      ORDER BY i.created_at DESC
+        ${keysetClause}
+      ORDER BY i.created_at DESC, LOWER(i.repo_full_name) DESC, i.issue_number DESC
+      ${limitClause}
       `,
-      [githubId, since],
+      params,
+    );
+
+    if (!pagination) {
+      return {
+        github_id: githubId,
+        since,
+        generated_at: new Date().toISOString(),
+        issues: rows,
+      };
+    }
+
+    const page = buildPaginatedResponse(
+      rows as Record<string, unknown>[],
+      pagination.limit,
+      (row) => ({
+        created_at: row.created_at as string,
+        repo_full_name: row.repo_full_name as string,
+        issue_number: row.issue_number as number,
+      }),
     );
 
     return {
       github_id: githubId,
       since,
       generated_at: new Date().toISOString(),
-      issues: rows,
+      issues: page.items,
+      next_cursor: page.nextCursor,
     };
   }
 
@@ -298,12 +435,33 @@ export class MinersService {
     githubId: string,
     repoNames: string[],
     sinceValues: string[],
+    pagination: PaginationParams | null,
   ): Promise<{
     github_id: string;
     since: null;
     generated_at: string;
     issues: unknown[];
+    next_cursor?: string | null;
   }> {
+    const cursor = pagination?.cursor ?? null;
+    const keysetClause = cursor
+      ? `AND (i.created_at, LOWER(i.repo_full_name), i.issue_number) < ($4::timestamptz, $5, $6::int)`
+      : "";
+    const limitClause = pagination ? `LIMIT $${cursor ? 7 : 4}` : "";
+    const params: unknown[] = !pagination
+      ? [githubId, repoNames, sinceValues]
+      : cursor
+        ? [
+            githubId,
+            repoNames,
+            sinceValues,
+            cursor.createdAt,
+            cursor.repoFullName,
+            cursor.number,
+            pagination.limit + 1,
+          ]
+        : [githubId, repoNames, sinceValues, pagination.limit + 1];
+
     const rows = await this.dataSource.query(
       `
       WITH windows AS (
@@ -313,21 +471,46 @@ export class MinersService {
       FROM issues i
       JOIN windows w
         ON w.repo_full_name = LOWER(i.repo_full_name)
+      LEFT JOIN maintainers m_author
+        ON m_author.github_id = i.author_github_id
+       AND m_author.repo_full_name = LOWER(i.repo_full_name)
       WHERE i.author_github_id = $1
         AND (
           (i.state = 'OPEN' AND i.created_at >= w.since)
           OR (i.state = 'CLOSED' AND i.closed_at >= w.since)
         )
-      ORDER BY i.created_at DESC
+        ${keysetClause}
+      ORDER BY i.created_at DESC, LOWER(i.repo_full_name) DESC, i.issue_number DESC
+      ${limitClause}
       `,
-      [githubId, repoNames, sinceValues],
+      params,
+    );
+
+    if (!pagination) {
+      return {
+        github_id: githubId,
+        since: null,
+        generated_at: new Date().toISOString(),
+        issues: rows,
+      };
+    }
+
+    const page = buildPaginatedResponse(
+      rows as Record<string, unknown>[],
+      pagination.limit,
+      (row) => ({
+        created_at: row.created_at as string,
+        repo_full_name: row.repo_full_name as string,
+        issue_number: row.issue_number as number,
+      }),
     );
 
     return {
       github_id: githubId,
       since: null,
       generated_at: new Date().toISOString(),
-      issues: rows,
+      issues: page.items,
+      next_cursor: page.nextCursor,
     };
   }
 

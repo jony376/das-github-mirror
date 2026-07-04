@@ -5,7 +5,7 @@ CREATE TABLE IF NOT EXISTS reviews (
     pr_number               INTEGER         NOT NULL,
     reviewer_github_id      VARCHAR(255),
     reviewer_login          VARCHAR(255),
-    reviewer_association    VARCHAR(20),
+    reviewer_association    VARCHAR(20),    -- ingest snapshot; live role resolved at serve time via the maintainers table
     review_state            VARCHAR(30)     NOT NULL,
     submitted_at            TIMESTAMPTZ     NOT NULL,
 

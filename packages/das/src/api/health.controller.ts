@@ -107,9 +107,10 @@ export class HealthController {
 
   private async listRepoHealth(): Promise<RepoHealth[]> {
     // Soft-cleared rows (installationId=null after uninstall/remove) are kept
-    // for historical scoring evidence but are no longer tracked.
+    // for historical scoring evidence but are no longer tracked. Installed but
+    // unregistered repos are also excluded — webhook ingestion skips them.
     const repos = await this.repoRepo.find({
-      where: { installationId: Not(IsNull()) },
+      where: { installationId: Not(IsNull()), registered: true },
       select: ["repoFullName", "lastEventAt"],
     });
 

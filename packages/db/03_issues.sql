@@ -5,7 +5,7 @@ CREATE TABLE IF NOT EXISTS issues (
     issue_number        INTEGER         NOT NULL,
     author_github_id    VARCHAR(255),
     author_login        VARCHAR(255),
-    author_association  VARCHAR(20),
+    author_association  VARCHAR(20),    -- ingest snapshot; live role resolved at serve time via the maintainers table
     title               TEXT,
     state               VARCHAR(10)     NOT NULL,
     state_reason        VARCHAR(20),

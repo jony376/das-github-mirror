@@ -81,12 +81,16 @@ export class WebhookService {
 
     // All other events carry repo context and only persist data for registered repos.
     if (repoFullName) {
-      const repo = await this.repoRepo.findOneBy({ repoFullName });
-      if (!repo?.registered) {
+      const repo = await this.findRegisteredRepo(repoFullName);
+      if (!repo) {
         this.logger.log(
           `Skipping ${event}: repo ${repoFullName} not registered`,
         );
         return;
+      }
+      // Use the canonical repos PK so handlers do not write under a different casing.
+      if (payload.repository) {
+        payload.repository.full_name = repo.repoFullName;
       }
     }
 
@@ -116,11 +120,21 @@ export class WebhookService {
         await this.reviewCommentHandler.handle(payload);
         break;
       case "label":
-        // Repo-level label CRUD — not used for scoring, skip
+        await this.labelHandler.handleRepoLabel(payload);
         break;
       default:
         this.logger.debug(`Unhandled event type: ${event}`);
     }
+  }
+
+  private async findRegisteredRepo(repoFullName: string): Promise<Repo | null> {
+    return this.repoRepo
+      .createQueryBuilder("repo")
+      .where("LOWER(repo.repo_full_name) = LOWER(:repoFullName)", {
+        repoFullName,
+      })
+      .andWhere("repo.registered = :registered", { registered: true })
+      .getOne();
   }
 
   private async handleRepositoryEvent(
@@ -138,6 +152,11 @@ export class WebhookService {
       repoUpdate.defaultBranch = defaultBranch;
     }
 
-    await this.repoRepo.update(repoFullName, repoUpdate);
+    await this.repoRepo
+      .createQueryBuilder()
+      .update()
+      .set(repoUpdate)
+      .where("LOWER(repo_full_name) = LOWER(:repoFullName)", { repoFullName })
+      .execute();
   }
 }

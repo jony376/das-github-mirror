@@ -2,9 +2,11 @@ import { Processor, WorkerHost, InjectQueue } from "@nestjs/bullmq";
 import { Logger } from "@nestjs/common";
 import { InjectRepository } from "@nestjs/typeorm";
 import { IsNull, Repository } from "typeorm";
-import { Job, Queue } from "bullmq";
+import { QueryDeepPartialEntity } from "typeorm/query-builder/QueryPartialEntity";
+import { DelayedError, Job, Queue } from "bullmq";
 import { Issue, PullRequest } from "../entities";
 import { GitHubFetcherService } from "../webhook/github-fetcher.service";
+import { GitHubRateLimitError } from "../webhook/github-rate-limit.error";
 import {
   FETCH_QUEUE,
   FETCH_JOBS,
@@ -61,29 +63,49 @@ export class FetchProcessor extends WorkerHost {
     super();
   }
 
-  async process(job: Job<JobData>): Promise<void> {
-    switch (job.name) {
-      case FETCH_JOBS.PR_METADATA: {
-        const { repoFullName, prNumber } = job.data as PrMetadataJobData;
-        await this.handlePrMetadata(repoFullName, prNumber);
-        break;
+  async process(job: Job<JobData>, token?: string): Promise<void> {
+    try {
+      switch (job.name) {
+        case FETCH_JOBS.PR_METADATA: {
+          const { repoFullName, prNumber } = job.data as PrMetadataJobData;
+          await this.handlePrMetadata(repoFullName, prNumber);
+          break;
+        }
+        case FETCH_JOBS.PR_FILES: {
+          await this.handlePrFiles(job.data as PrFilesJobData);
+          break;
+        }
+        case FETCH_JOBS.BACKFILL_REPO: {
+          const { repoFullName, days } = job.data as BackfillRepoJobData;
+          await this.handleBackfill(
+            repoFullName,
+            days ?? DEFAULT_BACKFILL_DAYS,
+          );
+          break;
+        }
+        case FETCH_JOBS.ISSUE_CLOSURE: {
+          const { repoFullName, issueNumber } = job.data as IssueClosureJobData;
+          await this.handleIssueClosure(repoFullName, issueNumber);
+          break;
+        }
+        default:
+          this.logger.warn(`Unknown job name: ${job.name}`);
       }
-      case FETCH_JOBS.PR_FILES: {
-        await this.handlePrFiles(job.data as PrFilesJobData);
-        break;
+    } catch (err) {
+      // GitHub budget exhausted: defer this job until the limit resets instead
+      // of failing it. moveToDelayed re-queues without consuming a retry attempt
+      // and frees the worker slot for other jobs (e.g. other installations,
+      // which have independent budgets) while we wait.
+      if (err instanceof GitHubRateLimitError) {
+        const retryAt = Date.now() + err.retryAfterMs;
+        this.logger.warn(
+          `[rate-limit-defer] job=${job.name} id=${job.id} ` +
+            `retry_in_s=${Math.round(err.retryAfterMs / 1000)}`,
+        );
+        await job.moveToDelayed(retryAt, token);
+        throw new DelayedError();
       }
-      case FETCH_JOBS.BACKFILL_REPO: {
-        const { repoFullName, days } = job.data as BackfillRepoJobData;
-        await this.handleBackfill(repoFullName, days ?? DEFAULT_BACKFILL_DAYS);
-        break;
-      }
-      case FETCH_JOBS.ISSUE_CLOSURE: {
-        const { repoFullName, issueNumber } = job.data as IssueClosureJobData;
-        await this.handleIssueClosure(repoFullName, issueNumber);
-        break;
-      }
-      default:
-        this.logger.warn(`Unknown job name: ${job.name}`);
+      throw err;
     }
   }
 
@@ -123,19 +145,47 @@ export class FetchProcessor extends WorkerHost {
   ): Promise<void> {
     this.logger.log(`Fetching PR metadata for ${repoFullName}#${prNumber}`);
 
-    const { closingIssueNumbers, body, lastEditedAt } =
-      await this.fetcher.fetchPrMetadata(repoFullName, prNumber);
+    const {
+      closingIssueNumbers,
+      body,
+      lastEditedAt,
+      state,
+      mergedAt,
+      closedAt,
+      mergedByLogin,
+    } = await this.fetcher.fetchPrMetadata(repoFullName, prNumber);
     const currentClosingIssueNumbers =
       this.uniqueIssueNumbers(closingIssueNumbers);
 
-    await this.prRepo.update(
-      { repoFullName, prNumber },
-      {
-        closingIssueNumbers: currentClosingIssueNumbers,
-        body,
-        lastEditedAt,
-      },
-    );
+    // Re-assert authoritative state from GraphQL so a missed
+    // `pull_request.closed` webhook self-heals (see PrReconcileService, which
+    // enqueues this job for every still-open PR on a schedule). MERGED is
+    // terminal: never let an in-flight stale fetch revert a merged PR back to
+    // OPEN/CLOSED — only forward transitions are applied.
+    const existing = await this.prRepo.findOne({
+      where: { repoFullName, prNumber },
+      select: { state: true },
+    });
+    const applyState = !(existing?.state === "MERGED" && state !== "MERGED");
+
+    if (applyState && existing && existing.state !== state) {
+      this.logger.warn(
+        `State drift corrected for ${repoFullName}#${prNumber}: ` +
+          `${existing.state} → ${state} (missed webhook)`,
+      );
+    }
+
+    // Cast past the entity's non-null column types: merged_at/closed_at/
+    // merged_by_login are nullable in the DB, and writing null is correct
+    // (clears them on a reopened PR).
+    const update = {
+      closingIssueNumbers: currentClosingIssueNumbers,
+      body,
+      lastEditedAt,
+      ...(applyState ? { state, mergedAt, closedAt, mergedByLogin } : {}),
+    } as QueryDeepPartialEntity<PullRequest>;
+
+    await this.prRepo.update({ repoFullName, prNumber }, update);
 
     // Issue solver attribution is closure-driven (ISSUE_CLOSURE jobs read
     // ClosedEvent.closer). PR metadata only refreshes the PR-side text view
@@ -172,7 +222,9 @@ export class FetchProcessor extends WorkerHost {
 
     const sinceDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
 
-    // Fetch and upsert PRs
+    // Fetch and upsert PRs. Each entry carries per-PR gating flags computed
+    // against the pre-upsert stored row so the backfill (a safety net behind
+    // real-time webhooks) only re-fetches what actually changed.
     const prs = await this.fetcher.backfillPullRequests(
       repoFullName,
       sinceDate,
@@ -180,32 +232,67 @@ export class FetchProcessor extends WorkerHost {
     this.logger.log(`Backfilled ${prs.length} PRs from ${repoFullName}`);
 
     // Fetch and upsert issues before PR metadata jobs can link solved_by_pr.
-    await this.fetcher.backfillIssues(repoFullName, sinceDate);
-    this.logger.log(`Backfilled issues from ${repoFullName}`);
+    const issueCount = await this.fetcher.backfillIssues(
+      repoFullName,
+      sinceDate,
+    );
+    this.logger.log(`Backfilled ${issueCount} issues from ${repoFullName}`);
 
-    // Enqueue follow-up jobs (metadata + files for every PR).
-    for (const { prNumber, headSha, baseSha } of prs) {
-      await this.fetchQueue.add(
-        FETCH_JOBS.PR_METADATA,
-        { repoFullName, prNumber },
-        {
-          jobId: `meta-${repoFullName}-${prNumber}`,
-          removeOnComplete: true,
-          // Match the webhook handler — failed metadata jobs must not squat
-          // on the stable per-PR jobId (#75).
-          removeOnFail: true,
-          attempts: 3,
-          backoff: { type: "exponential", delay: 5000 },
-        },
-      );
+    // Enqueue follow-up jobs, gated per-PR: PR_METADATA when GitHub's
+    // updatedAt moved, PR_FILES when content is missing or head/base SHA moved.
+    let metadataEnqueued = 0;
+    let metadataSkipped = 0;
+    let filesEnqueued = 0;
+    let filesSkipped = 0;
 
-      await this.enqueuePrFilesJob(
-        repoFullName,
-        prNumber,
-        headSha ?? null,
-        baseSha ?? null,
-      );
+    for (const {
+      prNumber,
+      headSha,
+      baseSha,
+      needsFilesJob,
+      needsMetadataJob,
+    } of prs) {
+      if (needsMetadataJob) {
+        await this.fetchQueue.add(
+          FETCH_JOBS.PR_METADATA,
+          { repoFullName, prNumber },
+          {
+            jobId: `meta-${repoFullName}-${prNumber}`,
+            removeOnComplete: true,
+            // Match the webhook handler — failed metadata jobs must not squat
+            // on the stable per-PR jobId (#75).
+            removeOnFail: true,
+            attempts: 3,
+            backoff: { type: "exponential", delay: 5000 },
+          },
+        );
+        metadataEnqueued += 1;
+      } else {
+        metadataSkipped += 1;
+      }
+
+      if (needsFilesJob) {
+        await this.enqueuePrFilesJob(
+          repoFullName,
+          prNumber,
+          headSha ?? null,
+          baseSha ?? null,
+        );
+        filesEnqueued += 1;
+      } else {
+        filesSkipped += 1;
+      }
     }
+
+    // Single greppable summary line for the mirror docker logs
+    // (`docker logs ghm-das`) when debugging rate-limit / churn issues.
+    this.logger.log(
+      `[backfill-summary] repo=${repoFullName} window_days=${days} ` +
+        `prs_in_window=${prs.length} ` +
+        `meta_enqueued=${metadataEnqueued} meta_skipped=${metadataSkipped} ` +
+        `files_enqueued=${filesEnqueued} files_skipped=${filesSkipped} ` +
+        `issues_backfilled=${issueCount}`,
+    );
   }
 
   private async handleStalePrFilesJob(

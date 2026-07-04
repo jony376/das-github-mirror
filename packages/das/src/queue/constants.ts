@@ -7,7 +7,7 @@ export const FETCH_JOBS = {
   ISSUE_CLOSURE: "fetch-issue-closure",
 } as const;
 
-export const DEFAULT_BACKFILL_DAYS = 40;
+export const DEFAULT_BACKFILL_DAYS = 10;
 
 export function prFilesJobId(
   repoFullName: string,

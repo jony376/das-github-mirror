@@ -32,3 +32,4 @@ data/
 # GitHub App private keys, etc.
 secrets/
 *.pem
+*.md

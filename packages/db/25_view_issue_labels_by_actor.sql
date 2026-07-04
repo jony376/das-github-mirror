@@ -9,11 +9,11 @@ WITH latest_events AS (
         le.label_name,
         le.action,
         le.actor_github_id,
-        crr.author_association AS actor_association
+        m.association AS actor_association
     FROM label_events le
-    LEFT JOIN contributor_repo_roles crr
-        ON crr.author_github_id = le.actor_github_id
-        AND crr.repo_full_name = le.repo_full_name
+    LEFT JOIN maintainers m
+        ON m.github_id = le.actor_github_id
+        AND m.repo_full_name = LOWER(le.repo_full_name)
     WHERE le.target_type = 'issue'
     ORDER BY le.repo_full_name, le.target_number, le.label_name, le.timestamp DESC
 )

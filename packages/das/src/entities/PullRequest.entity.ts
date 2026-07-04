@@ -35,6 +35,10 @@ export class PullRequest {
   @Column({ name: "merged_at", type: "timestamptz", nullable: true })
   mergedAt: string;
 
+  // ISO string on write, Date on read (TypeORM hydrates timestamptz).
+  @Column({ name: "updated_at", type: "timestamptz", nullable: true })
+  updatedAt: Date | string | null;
+
   @Column({ name: "last_edited_at", type: "timestamptz", nullable: true })
   lastEditedAt: string | null;
 

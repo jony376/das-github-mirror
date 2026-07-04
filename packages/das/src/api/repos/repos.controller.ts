@@ -11,10 +11,10 @@ export class ReposController {
   @ApiOperation({
     summary: "Maintainer-role contributors for a repo",
     description:
-      "Returns users whose latest known GitHub association for the repo " +
-      "is OWNER, MEMBER, or COLLABORATOR, synthesized from PR/issue/" +
-      "review/comment activity (contributor_repo_roles view). An unknown " +
-      "repo returns an empty maintainers list, not a 404.",
+      "Returns users whose live GitHub association for the repo is OWNER, " +
+      "MEMBER, or COLLABORATOR, from the maintainers table (direct " +
+      "collaborators + org members, refreshed hourly). An unknown repo " +
+      "returns an empty maintainers list, not a 404.",
   })
   @ApiParam({ name: "owner", description: "Repository owner (org or user)" })
   @ApiParam({ name: "repo", description: "Repository name" })
@@ -23,5 +23,24 @@ export class ReposController {
     @Param("repo") repo: string,
   ): Promise<unknown> {
     return this.repos.getMaintainers(owner, repo);
+  }
+
+  @Get(":owner/:repo/installation")
+  @ApiOperation({
+    summary: "GitHub App installation status for a repo",
+    description:
+      "Returns whether the Gittensor Mirror GitHub App is installed on the " +
+      "repo (installation_id present), independent of whether the repo is " +
+      "registered. The registration UI uses this to verify the install step " +
+      "before a repo is registered. An unknown repo returns installed=false, " +
+      "not a 404.",
+  })
+  @ApiParam({ name: "owner", description: "Repository owner (org or user)" })
+  @ApiParam({ name: "repo", description: "Repository name" })
+  async getInstallationStatus(
+    @Param("owner") owner: string,
+    @Param("repo") repo: string,
+  ): Promise<unknown> {
+    return this.repos.getInstallationStatus(owner, repo);
   }
 }

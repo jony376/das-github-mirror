@@ -26,7 +26,7 @@ export class InstallationHandler {
         .createQueryBuilder()
         .update()
         .set({ installationId: null, registered: false })
-        .where("installationId = :id", { id: String(installationId) })
+        .where("installation_id = :id", { id: String(installationId) })
         .execute();
       return;
     }
@@ -38,6 +38,7 @@ export class InstallationHandler {
       payload.repositories ?? payload.repositories_added ?? [];
 
     for (const repo of repos) {
+      const repoFullName = String(repo.full_name);
       // Atomic upsert: insert with addedAt on first encounter; on conflict only
       // update installationId so addedAt is never overwritten on re-fires.
       await this.repoRepo
@@ -45,23 +46,37 @@ export class InstallationHandler {
         .insert()
         .into(Repo)
         .values({
-          repoFullName: repo.full_name,
+          repoFullName,
           installationId: String(installationId),
           addedAt: new Date().toISOString(),
         })
-        .orUpdate(["installationId"], ["repoFullName"])
+        .orUpdate(["installation_id"], ["repo_full_name"])
         .execute();
-      this.logger.log(`Tracking repo: ${repo.full_name}`);
+      this.logger.log(`Tracking repo: ${repoFullName}`);
     }
 
     // installation_repositories.removed — soft clear, preserve historical data.
+    // Match case-insensitively so removal events clear rows even if earlier
+    // registration paths preserved a different Owner/Repo casing (#120).
     const removed: any[] = payload.repositories_removed ?? [];
     for (const repo of removed) {
-      await this.repoRepo.update(repo.full_name, {
-        installationId: null,
-        registered: false,
-      });
-      this.logger.log(`Stopped tracking repo: ${repo.full_name}`);
+      const repoFullName = String(repo.full_name);
+      const result = await this.repoRepo
+        .createQueryBuilder()
+        .update()
+        .set({ installationId: null, registered: false })
+        .where("LOWER(repo_full_name) = LOWER(:repoFullName)", {
+          repoFullName,
+        })
+        .execute();
+
+      if (!result.affected) {
+        this.logger.warn(
+          `No repo row matched removal for ${repo.full_name} (canonical: ${repoFullName})`,
+        );
+      } else {
+        this.logger.log(`Stopped tracking repo: ${repoFullName}`);
+      }
     }
   }
 }

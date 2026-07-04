@@ -26,6 +26,13 @@ export class PullRequestHandler {
     const prNumber: number = pr.number;
     const action: string = payload.action;
 
+    // A merged PR is reported by REST as state=closed + merged=true. Key off
+    // `merged` alone — requiring a non-null `merged_at` too risks pinning the
+    // PR to OPEN if GitHub sends the closed event before merged_at is populated.
+    // Synthesize merged_at from closed_at when absent so the merge gate (which
+    // requires merged_at) downstream still passes.
+    const isMerged = Boolean(pr.merged);
+
     const data: Partial<PullRequest> = {
       repoFullName,
       prNumber,
@@ -33,10 +40,10 @@ export class PullRequestHandler {
       authorLogin: pr.user.login,
       authorAssociation: pr.author_association,
       title: pr.title,
-      state: pr.merged && pr.merged_at ? "MERGED" : pr.state.toUpperCase(),
+      state: isMerged ? "MERGED" : pr.state.toUpperCase(),
       createdAt: pr.created_at,
       closedAt: pr.closed_at ?? null,
-      mergedAt: pr.merged_at ?? null,
+      mergedAt: isMerged ? (pr.merged_at ?? pr.closed_at ?? null) : null,
       // last_edited_at is populated by the fetch-pr-metadata job via GraphQL —
       // REST's updated_at changes on any interaction, not just body edits.
       mergedByLogin: pr.merged_by?.login ?? null,

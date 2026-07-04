@@ -17,7 +17,20 @@ export class ReviewHandler {
     const review = payload.review;
     const repoFullName: string = payload.repository.full_name;
 
-    // Only store submitted reviews (not pending/dismissed)
+    if (payload.action === "dismissed") {
+      await this.reviewRepo.delete({
+        repoFullName,
+        prNumber: payload.pull_request.number,
+        reviewerGithubId: String(review.user.id),
+        submittedAt: review.submitted_at,
+      });
+      await this.repoRepo.update(repoFullName, {
+        lastEventAt: new Date().toISOString(),
+      });
+      return;
+    }
+
+    // Only store submitted reviews (not pending)
     if (payload.action !== "submitted") return;
 
     const data: Partial<Review> = {
